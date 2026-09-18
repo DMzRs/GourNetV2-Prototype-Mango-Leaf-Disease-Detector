@@ -116,10 +116,41 @@ def guess_label_from_filename(filename: str) -> str:
     return "Unknown"
 
 
+def _iter_conv_layers(layer):
+    for sub in getattr(layer, "layers", []):
+        yield from _iter_conv_layers(sub)
+    if isinstance(layer, tf.keras.layers.Conv2D):
+        yield layer
+
+
+def gradcam_overlay(model, batch: np.ndarray, orig_img: Image.Image, alpha: float = 0.45):
+    """Grad-CAM heatmap of the predicted class blended over the leaf photo."""
+    conv_layers = list(_iter_conv_layers(model))
+    conv_layer = conv_layers[-1]
+    grad_model = tf.keras.Model(model.inputs, [conv_layer.output, model.output])
+    with tf.GradientTape() as tape:
+        conv_out, preds = grad_model(batch, training=False)
+        top = int(tf.argmax(preds[0]))
+        loss = preds[:, top]
+    grads = tape.gradient(loss, conv_out)[0]
+    weights = tf.reduce_mean(grads, axis=(0, 1))
+    cam = tf.reduce_sum(conv_out[0] * weights, axis=-1).numpy()
+    cam = np.maximum(cam, 0.0)
+    cam = cam / (cam.max() + 1e-8)
+    cam = np.array(Image.fromarray((cam * 255).astype("uint8")).resize(IMG_SIZE, Image.BILINEAR)).astype(float) / 255.0
+    r = np.clip(1.5 - np.abs(4.0 * cam - 3.0), 0, 1)
+    g = np.clip(1.5 - np.abs(4.0 * cam - 2.0), 0, 1)
+    b = np.clip(1.5 - np.abs(4.0 * cam - 1.0), 0, 1)
+    base = np.array(orig_img.convert("RGB").resize(IMG_SIZE)).astype(float) / 255.0
+    overlay = (1.0 - alpha) * base + alpha * np.stack([r, g, b], axis=-1)
+    return Image.fromarray((np.clip(overlay, 0, 1) * 255).astype("uint8"))
+
+
 with st.sidebar:
     st.title("GourNet")
     variant = st.segmented_control("Weights", WEIGHT_OPTIONS, default="Standard")
     top_k = st.slider("Top-k classes per model", 1, 8, 3)
+    show_cam = st.toggle("Show Grad-CAM", value=True)
 
 st.title("Mango leaf disease detector")
 st.caption(f"Both models predict on the same uploaded image for direct comparison ({variant} weights).")
@@ -210,6 +241,14 @@ else:
                     for i in s["order"][:top_k]
                 ]
                 st.dataframe(pd.DataFrame(topk_rows), hide_index=True)
+                if show_cam:
+                    try:
+                        st.image(
+                            gradcam_overlay(models[key], batch, img),
+                            caption=f"Grad-CAM: {CLASS_NAMES[s['top_idx']]}",
+                        )
+                    except Exception as e:
+                        st.caption(f"Grad-CAM unavailable ({e}).")
 
     with st.container(horizontal=True):
         st.metric(
