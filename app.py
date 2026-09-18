@@ -107,6 +107,15 @@ def prediction_stats(probs: np.ndarray):
     }
 
 
+def guess_label_from_filename(filename: str) -> str:
+    """Match a disease class name inside the file name, else Unknown."""
+    stem = pathlib.Path(filename).stem.lower().replace("_", "").replace("-", "").replace(" ", "")
+    for name in CLASS_NAMES:
+        if name.lower().replace(" ", "") in stem:
+            return name
+    return "Unknown"
+
+
 with st.sidebar:
     st.title("GourNet")
     variant = st.segmented_control("Weights", WEIGHT_OPTIONS, default="Standard")
@@ -271,7 +280,17 @@ multi = st.file_uploader(
 )
 
 if multi:
-    label_rows = pd.DataFrame([{"File": f.name, "True label": "Unknown"} for f in multi])
+    label_rows = pd.DataFrame(
+        [{"File": f.name, "True label": guess_label_from_filename(f.name)} for f in multi]
+    )
+    auto_count = int((label_rows["True label"] != "Unknown").sum())
+    if auto_count:
+        st.caption(
+            f"Detected labels from file names for {auto_count}/{len(label_rows)} images. "
+            "Name files like Anthracnose_01.jpg. Correct any mistakes below."
+        )
+    else:
+        st.caption("Name files like Anthracnose_01.jpg to auto-fill labels, or set them below.")
     edited = st.data_editor(
         label_rows,
         key="batch_labels",
