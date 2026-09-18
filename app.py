@@ -123,8 +123,8 @@ def _iter_conv_layers(layer):
         yield layer
 
 
-def gradcam_overlay(model, batch: np.ndarray, orig_img: Image.Image, alpha: float = 0.45):
-    """Grad-CAM heatmap of the predicted class blended over the leaf photo."""
+def gradcam_cam(model, batch: np.ndarray) -> np.ndarray:
+    """Normalized Grad-CAM map of the predicted class at model input resolution."""
     conv_layers = list(_iter_conv_layers(model))
     conv_layer = conv_layers[-1]
     grad_model = tf.keras.Model(model.inputs, [conv_layer.output, model.output])
@@ -137,7 +137,11 @@ def gradcam_overlay(model, batch: np.ndarray, orig_img: Image.Image, alpha: floa
     cam = tf.reduce_sum(conv_out[0] * weights, axis=-1).numpy()
     cam = np.maximum(cam, 0.0)
     cam = cam / (cam.max() + 1e-8)
-    cam = np.array(Image.fromarray((cam * 255).astype("uint8")).resize(IMG_SIZE, Image.BILINEAR)).astype(float) / 255.0
+    return np.array(Image.fromarray((cam * 255).astype("uint8")).resize(IMG_SIZE, Image.BILINEAR)).astype(float) / 255.0
+
+
+def blend_heatmap(orig_img: Image.Image, cam: np.ndarray, alpha: float = 0.45) -> Image.Image:
+    """Blend a normalized CAM over the photo with a JET-style colormap."""
     r = np.clip(1.5 - np.abs(4.0 * cam - 3.0), 0, 1)
     g = np.clip(1.5 - np.abs(4.0 * cam - 2.0), 0, 1)
     b = np.clip(1.5 - np.abs(4.0 * cam - 1.0), 0, 1)
@@ -146,11 +150,44 @@ def gradcam_overlay(model, batch: np.ndarray, orig_img: Image.Image, alpha: floa
     return Image.fromarray((np.clip(overlay, 0, 1) * 255).astype("uint8"))
 
 
+def gradcam_overlay(model, batch: np.ndarray, orig_img: Image.Image, alpha: float = 0.45):
+    """Grad-CAM heatmap of the predicted class blended over the leaf photo."""
+    return blend_heatmap(orig_img, gradcam_cam(model, batch), alpha)
+
+
+def cam_focus(cam: np.ndarray, frac: float = 0.10) -> float:
+    """Share of heatmap mass in the hottest pixels. Higher means more focal, not more correct."""
+    flat = cam.flatten()
+    k = max(1, int(len(flat) * frac))
+    return float(np.partition(flat, -k)[-k:].sum() / (flat.sum() + 1e-8))
+
+
+def tta_stability(model, img: Image.Image, clean_top: int, n: int, seed: int = 7):
+    """Repeat prediction on lightly augmented copies. Returns (stability, mean conf, std conf)."""
+    rng = np.random.default_rng(seed)
+    agree, confs = 0, []
+    for _ in range(n):
+        aug = img.convert("RGB")
+        if rng.random() < 0.5:
+            aug = aug.transpose(Image.FLIP_LEFT_RIGHT)
+        aug = aug.rotate(float(rng.uniform(-15, 15)), resample=Image.BILINEAR)
+        factor = float(rng.uniform(0.9, 1.1))
+        aug = Image.fromarray(np.clip(np.array(aug).astype(float) * factor, 0, 255).astype("uint8"))
+        p = model.predict(preprocess_image(aug), verbose=0)[0].astype(float)
+        t = int(np.argmax(p))
+        confs.append(float(p[t]))
+        if t == clean_top:
+            agree += 1
+    return agree / n, float(np.mean(confs)), float(np.std(confs))
+
+
 with st.sidebar:
     st.title("GourNet")
     variant = st.segmented_control("Weights", WEIGHT_OPTIONS, default="Standard")
     top_k = st.slider("Top-k classes per model", 1, 8, 3)
     show_cam = st.toggle("Show Grad-CAM", value=True)
+    run_tta = st.toggle("Run TTA stability check", value=True)
+    tta_n = st.slider("TTA repeats per model", 5, 30, 10)
 
 st.title("Mango leaf disease detector")
 st.caption(f"Both models predict on the same uploaded image for direct comparison ({variant} weights).")
@@ -201,6 +238,19 @@ else:
     a, b = results[a_key], results[b_key]
     agree = a["stats"]["top_idx"] == b["stats"]["top_idx"]
 
+    with st.spinner("Computing Grad-CAM and TTA stability..."):
+        for key in MODEL_KEYS:
+            try:
+                cam = gradcam_cam(models[key], batch)
+                results[key]["cam"] = cam
+                results[key]["focus"] = cam_focus(cam)
+                results[key]["overlay"] = blend_heatmap(img, cam)
+            except Exception as e:
+                results[key]["cam_error"] = str(e)
+            if run_tta:
+                stab, mean_c, std_c = tta_stability(models[key], img, results[key]["stats"]["top_idx"], tta_n)
+                results[key]["tta"] = (stab, mean_c, std_c)
+
     if agree:
         st.success(
             f"Both models predict **{CLASS_NAMES[a['stats']['top_idx']]}** — "
@@ -242,13 +292,10 @@ else:
                 ]
                 st.dataframe(pd.DataFrame(topk_rows), hide_index=True)
                 if show_cam:
-                    try:
-                        st.image(
-                            gradcam_overlay(models[key], batch, img),
-                            caption=f"Grad-CAM: {CLASS_NAMES[s['top_idx']]}",
-                        )
-                    except Exception as e:
-                        st.caption(f"Grad-CAM unavailable ({e}).")
+                    if "overlay" in r:
+                        st.image(r["overlay"], caption=f"Grad-CAM: {CLASS_NAMES[s['top_idx']]}")
+                    else:
+                        st.caption(f"Grad-CAM unavailable ({r.get('cam_error', 'error')}).")
 
     with st.container(horizontal=True):
         st.metric(
@@ -268,6 +315,32 @@ else:
             MODEL_REGISTRY[a_key if a["stats"]["margin"] >= b["stats"]["margin"] else b_key]["short"],
             f"{abs(a['stats']['margin'] - b['stats']['margin']) * 100:.1f} pp difference",
             border=True,
+        )
+
+    st.subheader("Robustness")
+    st.caption("Focal and stable do not mean correct. Confirm against test-set accuracy.")
+    with st.container(horizontal=True):
+        if "focus" in a and "focus" in b:
+            st.metric(
+                "More focal CAM",
+                MODEL_REGISTRY[a_key if a["focus"] >= b["focus"] else b_key]["short"],
+                f"{max(a['focus'], b['focus']) * 100:.0f}% mass in hottest 10% area",
+                border=True,
+            )
+        if run_tta and "tta" in a and "tta" in b:
+            st.metric(
+                "More stable (TTA)",
+                MODEL_REGISTRY[a_key if a["tta"][0] >= b["tta"][0] else b_key]["short"],
+                f"{max(a['tta'][0], b['tta'][0]) * 100:.0f}% agree over {tta_n} runs",
+                border=True,
+            )
+    if run_tta and "tta" in a and "tta" in b:
+        st.caption(
+            f"TTA detail — {MODEL_REGISTRY[a_key]['short']}: {a['tta'][0] * 100:.0f}% stable, "
+            f"conf {a['tta'][1] * 100:.1f}±{a['tta'][2] * 100:.1f}%; "
+            f"{MODEL_REGISTRY[b_key]['short']}: {b['tta'][0] * 100:.0f}% stable, "
+            f"conf {b['tta'][1] * 100:.1f}±{b['tta'][2] * 100:.1f}% "
+            f"(flip, ±15° rotation, brightness over {tta_n} runs)."
         )
 
     st.subheader("Per-class probabilities")
