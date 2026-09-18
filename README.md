@@ -1,4 +1,4 @@
-# GourNet Mango Leaf Disease Detector
+# GourNetV2 Mango Leaf Disease Detector
 
 A Streamlit application for side-by-side comparison of two convolutional neural network
 classifiers for mango leaf disease detection: the baseline **GourNet** and the enhanced
